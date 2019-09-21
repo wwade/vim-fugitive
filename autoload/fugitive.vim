@@ -77,6 +77,8 @@ function! s:DirCheck(...) abort
     return ''
   elseif empty(bufname(''))
     return 'return ' . string('echoerr "fugitive: blank buffer unsupported (edit a file from a repository)"')
+  elseif &buftype=='terminal'
+    return ''
   else
     return 'return ' . string('echoerr "fugitive: file does not belong to a Git repository"')
   endif
