@@ -140,6 +140,16 @@ function! s:executable(binary) abort
   return s:executables[a:binary]
 endfunction
 
+function! s:DoAutocmd(cmd) abort
+  if v:version >= 704 || (v:version == 703 && has('patch442'))
+    return 'doautocmd <nomodeline>' . a:cmd
+  elseif &modelines > 0
+    return 'try|set modelines=0|doautocmd ' . a:cmd . '|finally|set modelines=' . &modelines . '|endtry'
+  else
+    return 'doautocmd ' . a:cmd
+  endif
+endfunction
+
 let s:nowait = v:version >= 704 ? '<nowait>' : ''
 
 function! s:Map(mode, lhs, rhs, ...) abort
@@ -1871,7 +1881,7 @@ function! fugitive#FileWriteCmd(...) abort
   let amatch = a:0 ? a:1 : expand('<amatch>')
   let autype = a:0 > 1 ? 'Buf' : 'File'
   if exists('#' . autype . 'WritePre')
-    execute 'doautocmd ' . autype . 'WritePre ' . s:fnameescape(amatch)
+    execute s:DoAutocmd(autype . 'WritePre ' . s:fnameescape(amatch))
   endif
   try
     let [dir, commit, file] = s:DirCommitFile(amatch)
@@ -1889,7 +1899,7 @@ function! fugitive#FileWriteCmd(...) abort
     if !exec_error
       setlocal nomodified
       if exists('#' . autype . 'WritePost')
-        execute 'doautocmd ' . autype . 'WritePost ' . s:fnameescape(amatch)
+        execute s:DoAutocmd(autype . 'WritePost ' . s:fnameescape(amatch))
       endif
       return ''
     else
@@ -1899,8 +1909,6 @@ function! fugitive#FileWriteCmd(...) abort
     call delete(tmp)
   endtry
 endfunction
-
-let s:nomodeline = (v:version >= 704 ? '<nomodeline>' : '')
 
 function! fugitive#BufReadCmd(...) abort
   let amatch = a:0 ? a:1 : expand('<amatch>')
@@ -2010,8 +2018,8 @@ function! fugitive#BufReadCmd(...) abort
     endtry
 
     setlocal modifiable
-    return 'silent doautocmd' . s:nomodeline .
-          \ ' BufReadPost' . (modifiable ? '' : '|setl nomodifiable')
+    return 'silent ' . s:DoAutocmd('BufReadPost') .
+          \ (modifiable ? '' : '|setl nomodifiable')
   catch /^fugitive:/
     return 'echoerr ' . string(v:exception)
   endtry
@@ -2132,7 +2140,9 @@ function! fugitive#Command(line1, line2, range, bang, mods, arg) abort
   if has('nvim') && executable('env')
     let pre .= 'env GIT_TERMINAL_PROMPT=0 '
   endif
-  return 'exe ' . string('!' . escape(pre . s:UserCommand(dir, args), '!#%')) . after
+  return 'exe ' . string('noautocmd !' . escape(pre . s:UserCommand(dir, args), '!#%')) .
+        \ '|call fugitive#ReloadStatus(' . string(dir) . ', 1)' .
+        \ after
 endfunction
 
 let s:exec_paths = {}
@@ -2315,8 +2325,23 @@ function! s:StageSeek(info, fallback) abort
   return exists('backup') ? backup : line - 1
 endfunction
 
-function! s:ReloadStatus(...) abort
-  call s:ExpireStatus(-1)
+function! s:DoAutocmdChanged(dir) abort
+  let dir = a:dir is# -2 ? '' : FugitiveGitDir(a:dir)
+  if empty(dir) || !exists('#User#FugitiveChanged') || exists('g:fugitive_event')
+    return ''
+  endif
+  try
+    let g:fugitive_event = dir
+    exe s:DoAutocmd('User FugitiveChanged')
+  finally
+    unlet! g:fugitive_event
+    " Force statusline reload with the buffer's Git dir
+    let &ro = &ro
+  endtry
+  return ''
+endfunction
+
+function! s:ReloadStatusBuffer(...) abort
   if get(b:, 'fugitive_type', '') !=# 'index'
     return ''
   endif
@@ -2325,6 +2350,13 @@ function! s:ReloadStatus(...) abort
   call fugitive#BufReadStatus()
   exe s:StageSeek(info, original_lnum)
   normal! 0
+  return ''
+endfunction
+
+function! s:ReloadStatus(...) abort
+  call s:ExpireStatus(-1)
+  call s:ReloadStatusBuffer(a:0 ? a:1 : line('.'))
+  exe s:DoAutocmdChanged(-1)
   return ''
 endfunction
 
@@ -2356,13 +2388,13 @@ function! s:ReloadWinStatus(...) abort
     return
   endif
   if !exists('b:fugitive_reltime')
-    exe s:ReloadStatus()
+    exe s:ReloadStatusBuffer()
     return
   endif
   let t = b:fugitive_reltime
   if reltimestr(reltime(s:last_time, t)) =~# '-\|\d\{10\}\.' ||
         \ reltimestr(reltime(get(s:last_times, s:cpath(s:Dir()), t), t)) =~# '-\|\d\{10\}\.'
-    exe s:ReloadStatus()
+    exe s:ReloadStatusBuffer()
   endif
 endfunction
 
@@ -2391,31 +2423,42 @@ function! s:ReloadTabStatus(...) abort
 endfunction
 
 function! fugitive#ReloadStatus(...) abort
-  call s:ExpireStatus(a:0 ? a:1 : -2)
-  if a:0 > 1 ? a:2 : s:CanAutoReloadStatus()
+  call s:ExpireStatus(a:0 ? a:1 : -1)
+  if a:0 > 1 ? a:2 : 1
     let t = reltime()
     let t:fugitive_reload_status = t
     for tabnr in exists('*settabvar') ? range(1, tabpagenr('$')) : []
       call settabvar(tabnr, 'fugitive_reload_status', t)
     endfor
     call s:ReloadTabStatus()
+    exe s:DoAutocmdChanged(a:0 ? a:1 : -1)
   else
     call s:ReloadWinStatus()
   endif
+  return ''
 endfunction
 
-function! s:CanAutoReloadStatus() abort
-  return get(g:, 'fugitive_autoreload_status', !has('win32'))
+function! fugitive#EfmDir(...) abort
+  let dir = matchstr(a:0 ? a:1 : &errorformat, '\c,%\\&\%(git\|fugitive\)_\=dir=\zs\%(\\.\|[^,]\)*')
+  let dir = substitute(dir, '%%', '%', 'g')
+  let dir = substitute(dir, '\\\ze[\,]', '', 'g')
+  return dir
 endfunction
 
 augroup fugitive_status
   autocmd!
   autocmd BufWritePost         * call fugitive#ReloadStatus(-1, 0)
-  autocmd ShellCmdPost     * nested call fugitive#ReloadStatus()
+  autocmd ShellCmdPost,ShellFilterPost * nested call fugitive#ReloadStatus(-2, 0)
   autocmd BufDelete * nested
-        \ if getbufvar(+expand('<abuf>'), 'buftype') == 'terminal' |
-        \   call fugitive#ReloadStatus() |
+        \ if getbufvar(+expand('<abuf>'), 'buftype') ==# 'terminal' |
+        \   if !empty(FugitiveGitDir(+expand('<abuf>'))) |
+        \     call fugitive#ReloadStatus(+expand('<abuf>'), 1) |
+        \   else |
+        \     call fugitive#ReloadStatus(-2, 0) |
+        \  endif |
         \ endif
+  autocmd QuickFixCmdPost make,lmake,[cl]file,[cl]getfile nested
+        \ call fugitive#ReloadStatus(fugitive#EfmDir(), 1)
   if !has('win32')
     autocmd FocusGained        * call fugitive#ReloadStatus(-2, 0)
   endif
@@ -3335,7 +3378,7 @@ function! s:RevertSubcommand(line1, line2, range, bang, mods, args) abort
   let no_commit = s:HasOpt(a:args, '-n', '--no-commit', '--no-edit', '--abort', '--continue', '--quit')
   let cmd = s:UserCommand(dir, ['revert'] + (no_commit ? [] : ['-n']) + a:args)
   let [out, exec_error] = s:SystemError(cmd)
-  call fugitive#ReloadStatus(-1, 1)
+  call fugitive#ReloadStatus(dir, 1)
   if no_commit || exec_error
     return 'echo ' . string(substitute(out, "\n$", '', ''))
   endif
@@ -3731,12 +3774,13 @@ function! s:GrepSubcommand(line1, line2, range, bang, mods, args) abort
   redraw
   call s:QuickfixCreate(listnr, {'title': (listnr < 0 ? ':Ggrep ' : ':Glgrep ') . s:fnameescape(args)})
   let tempfile = tempname()
-  if v:version >= 704 | exe 'silent doautocmd <nomodeline> QuickFixCmdPre ' (listnr < 0 ? 'Ggrep' : 'Glgrep') | endif
+  let event = listnr < 0 ? 'grep-fugitive' : 'lgrep-fugitive'
+  silent exe s:DoAutocmd('QuickFixCmdPre ' . event)
   exe '!' . escape(s:UserCommand(dir, cmd + args), '%#!')
         \ printf(&shellpipe . (&shellpipe =~# '%s' ? '' : ' %s'), s:shellesc(tempfile))
   let list = map(readfile(tempfile), 's:GrepParseLine(prefix, name_only, dir, v:val)')
   call s:QuickfixSet(listnr, list, 'a')
-  if v:version >= 704 | exe 'silent doautocmd <nomodeline> QuickFixCmdPost ' (listnr < 0 ? 'Ggrep' : 'Glgrep') | endif
+  silent exe s:DoAutocmd('QuickFixCmdPost ' . event)
   if !has('gui_running')
     redraw
   endif
@@ -4013,7 +4057,7 @@ function! fugitive#ReadCommand(line1, count, range, bang, mods, arg, args) abort
     let args = s:SplitExpand(a:arg, s:Tree(dir))
     silent execute mods . after . 'read!' escape(s:UserCommand(dir, ['--no-pager'] + args), '!#%')
     execute delete . 'diffupdate'
-    call fugitive#ReloadStatus()
+    call fugitive#ReloadStatus(dir, 1)
     return 'redraw|echo '.string(':!'.s:UserCommand(dir, args))
   endif
   try
@@ -4157,7 +4201,7 @@ function! fugitive#WriteCommand(line1, line2, range, bang, mods, arg, args) abor
 
   unlet! restorewinnr
   let zero = s:Generate(':0:'.file)
-  silent execute 'doautocmd' s:nomodeline 'BufWritePost' s:fnameescape(zero)
+  silent exe s:DoAutocmd('BufWritePost ' . s:fnameescape(zero))
   for tab in range(1,tabpagenr('$'))
     for winnr in range(1,tabpagewinnr(tab,'$'))
       let bufnr = tabpagebuflist(tab)[winnr-1]
@@ -4186,7 +4230,7 @@ function! fugitive#WriteCommand(line1, line2, range, bang, mods, arg, args) abor
       endif
     endfor
   endfor
-  call fugitive#ReloadStatus()
+  call fugitive#ReloadStatus(-1, 1)
   return 'checktime'
 endfunction
 
@@ -4235,7 +4279,8 @@ function! s:Dispatch(bang, cmd, args) abort
   let [mp, efm, cc] = [&l:mp, &l:efm, get(b:, 'current_compiler', '')]
   try
     let b:current_compiler = 'git'
-    let &l:errorformat = s:common_efm
+    let &l:errorformat = s:common_efm .
+          \ ',%\&git_dir=' . escape(substitute(dir, '%', '%%', 'g'), '\,')
     let &l:makeprg = s:UserCommand(dir, s:AskPassArgs(dir) + [a:cmd] + a:args)
     if exists(':Make') == 2
       Make
@@ -4248,7 +4293,7 @@ function! s:Dispatch(bang, cmd, args) abort
       endif
       silent noautocmd make!
       redraw!
-      return 'call fugitive#Cwindow()|silent doautocmd ShellCmdPost'
+      return 'call fugitive#Cwindow()|silent ' . s:DoAutocmd('ShellCmdPost')
     endif
   finally
     let [&l:mp, &l:efm, b:current_compiler] = [mp, efm, cc]
@@ -4481,7 +4526,7 @@ function! fugitive#Diffsplit(autodir, keepfocus, mods, arg, args) abort
     exe pre
     let restore = s:diff_restore()
     let w:fugitive_diff_restore = restore
-    if s:CompareAge(commit, s:DirCommitFile(spec)[1]) < 0
+    if len(spec) && s:CompareAge(commit, s:DirCommitFile(spec)[1]) < 0
       let mods = s:Mods(mods, 'rightbelow')
     else
       let mods = s:Mods(mods, 'leftabove')
@@ -4546,15 +4591,15 @@ function! s:Move(force, rename, destination) abort
   if isdirectory(destination)
     let destination = fnamemodify(s:sub(destination,'/$','').'/'.expand('%:t'),':.')
   endif
-  call fugitive#ReloadStatus(dir)
+  let reload = '|call fugitive#ReloadStatus(' . string(dir) . ', 1)'
   if empty(s:DirCommitFile(@%)[1])
     if isdirectory(destination)
-      return 'keepalt edit '.s:fnameescape(destination)
+      return 'keepalt edit '.s:fnameescape(destination) . reload
     else
-      return 'keepalt saveas! '.s:fnameescape(destination)
+      return 'keepalt saveas! '.s:fnameescape(destination) . reload
     endif
   else
-    return 'file '.s:fnameescape(fugitive#Find(':0:'.destination, dir))
+    return 'file '.s:fnameescape(fugitive#Find(':0:'.destination, dir)) . reload
   endif
 endfunction
 
@@ -4593,8 +4638,7 @@ function! s:Remove(after, force) abort
     let v:errmsg = 'fugitive: '.s:sub(message,'error:.*\zs\n\(.*-f.*',' (add ! to force)')
     return 'echoerr '.string(v:errmsg)
   else
-    call fugitive#ReloadStatus(dir)
-    return a:after . (a:force ? '!' : '')
+    return a:after . (a:force ? '!' : ''). '|call fugitive#ReloadStatus(' . string(dir) . ', 1)'
   endif
 endfunction
 
@@ -4775,9 +4819,10 @@ function! s:BlameSubcommand(line1, count, range, bang, mods, args) abort
     else
       silent! execute '%write !'.basecmd.' > '.temp.' 2> '.error
     endif
+    let l:shell_error = v:shell_error
     redraw
     try
-      if v:shell_error
+      if l:shell_error
         let lines = readfile(error)
         if empty(lines)
           let lines = readfile(temp)
@@ -5076,8 +5121,8 @@ function! s:BlameFileType() abort
   if &modifiable
     return ''
   endif
-  call s:Map('n', '<F1>', ':help fugitive-:Gblame<CR>', '<silent>')
-  call s:Map('n', 'g?',   ':help fugitive-:Gblame<CR>', '<silent>')
+  call s:Map('n', '<F1>', ':help :Gblame<CR>', '<silent>')
+  call s:Map('n', 'g?',   ':help :Gblame<CR>', '<silent>')
   if mapcheck('q', 'n') =~# '^$\|bdelete'
     call s:Map('n', 'q',  ':exe <SID>BlameQuit()<Bar>echohl WarningMsg<Bar>echo ":Gblame q is deprecated in favor of gq"<Bar>echohl NONE<CR>', '<silent>')
   endif
@@ -5849,15 +5894,10 @@ augroup END
 
 function! fugitive#Init() abort
   if exists('#User#FugitiveBoot')
-    try
-      let [save_mls, &modelines] = [&mls, 0]
-      doautocmd User FugitiveBoot
-    finally
-      let &mls = save_mls
-    endtry
+    exe s:DoAutocmd('User FugitiveBoot')
   endif
   let dir = s:Dir()
-  if stridx(&tags, escape(dir, ', ')) == -1 && &tags !~# '\.git' && !exists('s:tags_warning')
+  if &tags !~# '\.git' && @% !~# '\.git' && !exists('s:tags_warning')
     let actualdir = fugitive#Find('.git/', dir)
     if filereadable(actualdir . 'tags')
       let s:tags_warning = 1
@@ -5866,13 +5906,8 @@ function! fugitive#Init() abort
       echohl NONE
     endif
   endif
-  try
-    let [save_mls, &modelines] = [&mls, 0]
-    call s:define_commands()
-    doautocmd User Fugitive
-  finally
-    let &mls = save_mls
-  endtry
+  call s:define_commands()
+  exe s:DoAutocmd('User Fugitive')
 endfunction
 
 function! fugitive#is_git_dir(path) abort
