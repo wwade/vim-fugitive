@@ -4597,7 +4597,7 @@ function! fugitive#Diffsplit(autodir, keepfocus, mods, arg, args) abort
   try
     if exists('parents') && len(parents) > 1
       exe pre
-      let mods = (a:autodir ? s:diff_modifier(len(parents) + 1) : '') . s:Mods(mods, 'leftabove')
+      let mods = (a:autodir ? s:diff_modifier(len(parents) + 1) : '') . s:Mods(mods, 'rightbelow')
       let nr = bufnr('')
       execute mods 'split' s:fnameescape(s:Generate(parents[0]))
       call s:Map('n', 'dp', ':diffput '.nr.'<Bar>diffupdate<CR>', '<silent>')
@@ -4605,7 +4605,7 @@ function! fugitive#Diffsplit(autodir, keepfocus, mods, arg, args) abort
       call s:diffthis()
       exe back
       call s:Map('n', 'd2o', ':diffget '.nr2.'<Bar>diffupdate<CR>', '<silent>')
-      let mods = substitute(mods, '\Cleftabove\|rightbelow\|aboveleft\|belowright', '\=submatch(0) =~# "f" ? "rightbelow" : "leftabove"', '')
+      let mods = substitute(mods, '\Cleftabove\|rightbelow\|aboveleft\|belowright', '\=submatch(0) =~# "f" ? "rightbelow" : "rightbelow"', '')
       for i in range(len(parents)-1, 1, -1)
         execute mods 'split' s:fnameescape(s:Generate(parents[i]))
         call s:Map('n', 'dp', ':diffput '.nr.'<Bar>diffupdate<CR>', '<silent>')
@@ -4662,7 +4662,7 @@ function! fugitive#Diffsplit(autodir, keepfocus, mods, arg, args) abort
     if len(spec) && s:CompareAge(commit, s:DirCommitFile(spec)[1]) < 0
       let mods = s:Mods(mods, 'rightbelow')
     else
-      let mods = s:Mods(mods, 'leftabove')
+      let mods = s:Mods(mods, 'rightbelow')
     endif
     let mods = (a:autodir ? s:diff_modifier(2) : '') . mods
     if &diffopt =~# 'vertical'
